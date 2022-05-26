@@ -12,7 +12,7 @@ from torch.nn import LSTM as _LSTM
 
 from darts import TimeSeries
 from darts.logging import get_logger, raise_if, raise_if_not
-from darts.models.components.attention import ProbSparseAttention, FullAttention, LogSparseAttention, AttentionLayer
+from darts.models.components.self_attention import ProbSparseAttention, FullAttention, LogSparseAttention, AttentionLayer
 from darts.models.forecasting.pl_forecasting_module import PLMixedCovariatesModule
 from darts.models.forecasting.tft_submodels import (
     _GateAddNorm,
