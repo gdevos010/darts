@@ -12,6 +12,7 @@ from torch.nn import LSTM as _LSTM
 
 from darts import TimeSeries
 from darts.logging import get_logger, raise_if, raise_if_not
+from darts.models.components.attention import ProbSparseAttention, FullAttention, LogSparseAttention, AttentionLayer
 from darts.models.forecasting.pl_forecasting_module import PLMixedCovariatesModule
 from darts.models.forecasting.tft_submodels import (
     _GateAddNorm,
@@ -37,17 +38,18 @@ MixedCovariatesTrainTensorType = Tuple[
 
 class _TFTModule(PLMixedCovariatesModule):
     def __init__(
-        self,
-        output_dim: Tuple[int, int],
-        variables_meta: Dict[str, Dict[str, List[str]]],
-        hidden_size: Union[int, List[int]] = 16,
-        lstm_layers: int = 1,
-        num_attention_heads: int = 4,
-        full_attention: bool = False,
-        hidden_continuous_size: int = 8,
-        dropout: float = 0.1,
-        add_relative_index: bool = False,
-        **kwargs,
+            self,
+            output_dim: Tuple[int, int],
+            variables_meta: Dict[str, Dict[str, List[str]]],
+            hidden_size: Union[int, List[int]] = 16,
+            lstm_layers: int = 1,
+            num_attention_heads: int = 4,
+            full_attention: bool = False,
+            hidden_continuous_size: int = 8,
+            dropout: float = 0.1,
+            add_relative_index: bool = False,
+            attention_type: str = "Interpretable",
+            **kwargs,
     ):
 
         """PyTorch module implementing the TFT architecture from `this paper <https://arxiv.org/pdf/1912.09363.pdf>`_
@@ -221,12 +223,26 @@ class _TFTModule(PLMixedCovariatesModule):
             context_size=self.hidden_size,
         )
 
-        # attention for long-range processing
-        self.multihead_attn = _InterpretableMultiHeadAttention(
-            d_model=self.hidden_size,
-            n_head=self.num_attention_heads,
-            dropout=self.dropout,
-        )
+        if attention_type == "Interpretable":
+            self.multihead_attn = _InterpretableMultiHeadAttention(
+                d_model=self.hidden_size,
+                n_head=self.num_attention_heads,
+                dropout=self.dropout,
+            )
+        else:
+            # attention for long-range processing
+            if attention_type == "prob":
+                attention = ProbSparseAttention(mask_flag=False, attention_dropout=dropout, output_attention=False)
+            elif attention_type == "log":
+                attention = LogSparseAttention(mask_flag=False, attention_dropout=dropout, output_attention=False)
+            elif attention_type == "full":
+                attention = FullAttention(mask_flag=False, attention_dropout=dropout, output_attention=False)
+            else:
+                raise ValueError(
+                    "Unknown attention type: {}".format(attention_type)
+                )
+            self.multihead_attn = AttentionLayer(attention, self.hidden_size, self.num_attention_heads)
+
         self.post_attn_gan = _GateAddNorm(self.hidden_size, dropout=self.dropout)
         self.positionwise_feedforward_grn = _GatedResidualNetwork(
             self.hidden_size, self.hidden_size, self.hidden_size, dropout=self.dropout
@@ -275,11 +291,11 @@ class _TFTModule(PLMixedCovariatesModule):
 
     @staticmethod
     def get_relative_index(
-        encoder_length: int,
-        decoder_length: int,
-        batch_size: int,
-        dtype: torch.dtype,
-        device: torch.device,
+            encoder_length: int,
+            decoder_length: int,
+            batch_size: int,
+            dtype: torch.dtype,
+            device: torch.device,
     ) -> torch.Tensor:
         """
         Returns scaled time index relative to prediction point.
@@ -294,7 +310,7 @@ class _TFTModule(PLMixedCovariatesModule):
 
     @staticmethod
     def get_attention_mask_full(
-        time_steps: int, batch_size: int, dtype: torch.dtype, device: torch.device
+            time_steps: int, batch_size: int, dtype: torch.dtype, device: torch.device
     ) -> torch.Tensor:
         """
         Returns causal mask to apply for self-attention layer.
@@ -305,7 +321,7 @@ class _TFTModule(PLMixedCovariatesModule):
 
     @staticmethod
     def get_attention_mask_future(
-        encoder_length: int, decoder_length: int, batch_size: int, device: str
+            encoder_length: int, decoder_length: int, batch_size: int, device: str
     ) -> torch.Tensor:
         """
         Returns causal mask to apply for self-attention layer that acts on future input only.
@@ -456,13 +472,13 @@ class _TFTModule(PLMixedCovariatesModule):
         # calculate initial state
         input_hidden = (
             self.static_context_hidden_encoder_grn(static_embedding)
-            .expand(self.lstm_layers, -1, -1)
-            .contiguous()
+                .expand(self.lstm_layers, -1, -1)
+                .contiguous()
         )
         input_cell = (
             self.static_context_cell_encoder_grn(static_embedding)
-            .expand(self.lstm_layers, -1, -1)
-            .contiguous()
+                .expand(self.lstm_layers, -1, -1)
+                .contiguous()
         )
 
         # run local lstm encoder
@@ -494,10 +510,10 @@ class _TFTModule(PLMixedCovariatesModule):
 
         # multi-head attention
         attn_out, attn_out_weights = self.multihead_attn(
-            q=attn_input if self.full_attention else attn_input[:, encoder_length:],
-            k=attn_input,
-            v=attn_input,
-            mask=self.attention_mask,
+            queries=attn_input if self.full_attention else attn_input[:, encoder_length:],
+            keys=attn_input,
+            values=attn_input,
+            attention_mask=self.attention_mask,
         )
 
         # skip connection over attention
@@ -537,19 +553,20 @@ class _TFTModule(PLMixedCovariatesModule):
 
 class TFTModel(MixedCovariatesTorchModel):
     def __init__(
-        self,
-        input_chunk_length: int,
-        output_chunk_length: int,
-        hidden_size: Union[int, List[int]] = 16,
-        lstm_layers: int = 1,
-        num_attention_heads: int = 4,
-        full_attention: bool = False,
-        dropout: float = 0.1,
-        hidden_continuous_size: int = 8,
-        add_relative_index: bool = False,
-        loss_fn: Optional[nn.Module] = None,
-        likelihood: Optional[Likelihood] = None,
-        **kwargs,
+            self,
+            input_chunk_length: int,
+            output_chunk_length: int,
+            hidden_size: Union[int, List[int]] = 16,
+            lstm_layers: int = 1,
+            num_attention_heads: int = 4,
+            full_attention: bool = False,
+            dropout: float = 0.1,
+            hidden_continuous_size: int = 8,
+            add_relative_index: bool = False,
+            loss_fn: Optional[nn.Module] = None,
+            likelihood: Optional[Likelihood] = None,
+            attention_type: str = "interpretable",
+            **kwargs,
     ):
         """Temporal Fusion Transformers (TFT) for Interpretable Time Series Forecasting.
 
@@ -747,6 +764,7 @@ class TFTModel(MixedCovariatesTorchModel):
         self.hidden_continuous_size = hidden_continuous_size
         self.add_relative_index = add_relative_index
         self.output_dim: Optional[Tuple[int, int]] = None
+        self.attention_type = attention_type
 
     def _create_model(self, train_sample: MixedCovariatesTrainTensorType) -> nn.Module:
         """
@@ -790,7 +808,7 @@ class TFTModel(MixedCovariatesTorchModel):
             )
             future_covariate = np.concatenate(
                 [
-                    ts[-self.output_chunk_length :]
+                    ts[-self.output_chunk_length:]
                     for ts in [future_covariate, expand_future_covariate]
                     if ts is not None
                 ],
@@ -881,15 +899,16 @@ class TFTModel(MixedCovariatesTorchModel):
             full_attention=self.full_attention,
             hidden_continuous_size=self.hidden_continuous_size,
             add_relative_index=self.add_relative_index,
+            attention_type=self.attention_type,
             **self.pl_module_params,
         )
 
     def _build_train_dataset(
-        self,
-        target: Sequence[TimeSeries],
-        past_covariates: Optional[Sequence[TimeSeries]],
-        future_covariates: Optional[Sequence[TimeSeries]],
-        max_samples_per_ts: Optional[int],
+            self,
+            target: Sequence[TimeSeries],
+            past_covariates: Optional[Sequence[TimeSeries]],
+            future_covariates: Optional[Sequence[TimeSeries]],
+            max_samples_per_ts: Optional[int],
     ) -> MixedCovariatesSequentialDataset:
 
         raise_if(
@@ -917,11 +936,11 @@ class TFTModel(MixedCovariatesTorchModel):
         )
 
     def _build_inference_dataset(
-        self,
-        target: Sequence[TimeSeries],
-        n: int,
-        past_covariates: Optional[Sequence[TimeSeries]],
-        future_covariates: Optional[Sequence[TimeSeries]],
+            self,
+            target: Sequence[TimeSeries],
+            n: int,
+            past_covariates: Optional[Sequence[TimeSeries]],
+            future_covariates: Optional[Sequence[TimeSeries]],
     ) -> MixedCovariatesInferenceDataset:
 
         return MixedCovariatesInferenceDataset(
