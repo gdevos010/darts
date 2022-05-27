@@ -12,7 +12,9 @@ from torch.nn import LSTM as _LSTM
 
 from darts import TimeSeries
 from darts.logging import get_logger, raise_if, raise_if_not
-from darts.models.components.self_attention import ProbSparseAttention, FullAttention, LogSparseAttention, AttentionLayer
+from darts.models.components.self_attention import ProbSparseAttention, FullAttention, LogSparseAttention, \
+    AttentionLayer
+from darts.models.components.mem_attention import MemAttention
 from darts.models.forecasting.pl_forecasting_module import PLMixedCovariatesModule
 from darts.models.forecasting.tft_submodels import (
     _GateAddNorm,
@@ -237,6 +239,8 @@ class _TFTModule(PLMixedCovariatesModule):
                 attention = LogSparseAttention(mask_flag=False, attention_dropout=dropout, output_attention=False)
             elif attention_type == "full":
                 attention = FullAttention(mask_flag=False, attention_dropout=dropout, output_attention=False)
+            elif attention_type == "memory":
+                attention = MemAttention(mask_flag=False)
             else:
                 raise ValueError(
                     "Unknown attention type: {}".format(attention_type)

@@ -214,13 +214,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-
-# from darts.models.components.masking import prob_mask
+from darts.models.components.mem_attention import MemAttention, default, reshape_dim
 
 
 class FullAttention(nn.Module):
     def __init__(
-        self, mask_flag=True, scale=None, attention_dropout=0.1, output_attention=False, **kwargs
+            self, mask_flag=True, scale=None, attention_dropout=0.1, output_attention=False, **kwargs
     ):
         super().__init__()
         self.mask_flag = mask_flag
@@ -355,8 +354,9 @@ class LogSparseAttention(nn.Module):
     Enhancing the locality and breaking the memory bottleneck of transformer on time series forecasting.
     arXiv preprint arXiv:1907.00235.
     """
+
     def __init__(
-        self, mask_flag=True, factor=5, scale=None, attention_dropout=0.1, output_attention=False
+            self, mask_flag=True, factor=5, scale=None, attention_dropout=0.1, output_attention=False
     ):
         super().__init__()
         self.scale = scale
@@ -381,7 +381,7 @@ class LogSparseAttention(nn.Module):
                 if (index - log_l + 1) < 0:
                     mask[:index] = 1
                     break
-                mask[index - log_l + 1 : (index + 1)] = 1  # Local attention
+                mask[index - log_l + 1: (index + 1)] = 1  # Local attention
                 for i in range(0, log_l):
                     new_index = index - log_l + 1 - 2 ** i
                     if (index - new_index) <= sub_len and new_index >= 0:
@@ -427,6 +427,7 @@ class AttentionLayer(nn.Module):
         self.out_projection = nn.Linear(d_values * n_heads, d_model)
 
         self.n_heads = n_heads
+        self.dim_heads = d_model // n_heads
         self.mix = mix
 
         self.init_weights()
@@ -438,18 +439,55 @@ class AttentionLayer(nn.Module):
             else:
                 torch.nn.init.zeros_(p)
 
-    def forward(self, queries, keys, values, attention_mask):
-        B, L, _ = queries.shape
-        _, S, _ = keys.shape
+    def forward(self, queries, keys, values, attention_mask, memories=None, pos_emb=None):
         H = self.n_heads
+        if isinstance(self.inner_attention, MemAttention) is False:
+            B, L, _ = queries.shape
+            _, S, _ = keys.shape
 
-        queries = self.query_projection(queries).view(B, L, H, -1)
-        keys = self.key_projection(keys).view(B, S, H, -1)
-        values = self.value_projection(values).view(B, S, H, -1)
+            queries = self.query_projection(queries).view(B, L, H, -1)
+            keys = self.key_projection(keys).view(B, S, H, -1)
+            values = self.value_projection(values).view(B, S, H, -1)
 
-        out, attention = self.inner_attention(queries, keys, values, attention_mask)
-        if self.mix:
-            out = out.transpose(2, 1).contiguous()
-        out = out.view(B, L, -1)
+            out, attention = self.inner_attention(queries, keys, values, attention_mask)
+            if self.mix:
+                out = out.transpose(2, 1).contiguous()
+            out = out.view(B, L, -1)
 
-        return self.out_projection(out), attention
+            return self.out_projection(out), attention
+        else:
+            b, t, e = queries.shape
+
+            memories = default(memories, (None, None))
+            mem, lmem = memories
+
+            init_mem = lambda: torch.empty(b, 0, e).to(queries.device)
+            mem = default(mem, init_mem)
+            lmem = default(lmem, init_mem)
+            mem_len, lmem_len = map(lambda t: t.shape[1], (mem, lmem))
+
+            kv_input = torch.cat((lmem, mem, queries), dim=1)
+
+            queries = self.query_projection(queries)
+
+            kv_len = kv_input.shape[1]
+            keys = self.key_projection(kv_input)
+            values = self.value_projection(kv_input)
+
+            merge_heads = lambda x: reshape_dim(x, -1, (-1, self.dim_heads)).transpose(1, 2)
+            q, k, v = map(merge_heads, (queries, keys, values))
+            k, v = map(lambda x: x.expand(-1, H, -1, -1), (k, v))
+
+            out = self.inner_attention(
+                q,
+                k,
+                v,
+                attention_mask,
+                pos_emb,
+                kv_len,
+                mem_len,
+                lmem_len
+            )
+            return self.out_projection(out), None
+
+
