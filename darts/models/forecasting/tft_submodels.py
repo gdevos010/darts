@@ -551,14 +551,14 @@ class _InterpretableMultiHeadAttention(nn.Module):
             else:
                 torch.nn.init.zeros_(p)
 
-    def forward(self, q, k, v, mask=None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, queries, keys, values, attention_mask=None) -> Tuple[torch.Tensor, torch.Tensor]:
         heads = []
         attns = []
-        vs = self.v_layer(v)
+        vs = self.v_layer(values)
         for i in range(self.n_head):
-            qs = self.q_layers[i](q)
-            ks = self.k_layers[i](k)
-            head, attn = self.attention(qs, ks, vs, mask)
+            qs = self.q_layers[i](queries)
+            ks = self.k_layers[i](keys)
+            head, attn = self.attention(qs, ks, vs, attention_mask)
             head_dropout = self.dropout(head)
             heads.append(head_dropout)
             attns.append(attn)

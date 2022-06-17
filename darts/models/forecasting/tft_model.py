@@ -12,8 +12,17 @@ from torch.nn import LSTM as _LSTM
 
 from darts import TimeSeries
 from darts.logging import get_logger, raise_if, raise_if_not
+
 from darts.models.components import glu_variants
 from darts.models.components.glu_variants import GLU_FFN
+
+from darts.models.components.axial_attention import AxialAttention
+from darts.models.components.mem_attention import MemAttention
+from darts.models.components.self_attention import (
+    AttentionLayer,
+    FullAttention,
+    LogSparseAttention,
+    ProbSparseAttention,
 from darts.models.forecasting.pl_forecasting_module import PLMixedCovariatesModule
 from darts.models.forecasting.tft_submodels import (
     _GateAddNorm,
@@ -51,6 +60,7 @@ class _TFTModule(PLMixedCovariatesModule):
         hidden_continuous_size: int = 8,
         dropout: float = 0.1,
         add_relative_index: bool = False,
+        attention_type: str = "Interpretable",
         **kwargs,
     ):
 
@@ -237,12 +247,47 @@ class _TFTModule(PLMixedCovariatesModule):
             context_size=self.hidden_size,
         )
 
-        # attention for long-range processing
-        self.multihead_attn = _InterpretableMultiHeadAttention(
-            d_model=self.hidden_size,
-            n_head=self.num_attention_heads,
-            dropout=self.dropout,
-        )
+        self.attention_type = attention_type
+        if attention_type == "Interpretable":
+            self.multihead_attn = _InterpretableMultiHeadAttention(
+                d_model=self.hidden_size,
+                n_head=self.num_attention_heads,
+                dropout=self.dropout,
+            )
+        elif attention_type == "axial":
+            self.multihead_attn = AxialAttention(
+                dim=self.output_chunk_length,  # embedding dimension
+                dim_index=1,  # where is the embedding dimension
+                dim_heads=32,  # dimension of each head. defaults to dim // heads if not supplied
+                heads=self.num_attention_heads,  # number of heads for multi-head attention
+                num_dimensions=1,  # number of axial dimensions (images is 2, video is 3, or more)
+                sum_axial_out=True
+                # whether to sum the contributions of attention on each axis, or to run the input through
+                # them sequentially. defaults to true
+            )
+            # TODO try axial embedding
+        else:
+            # attention for long-range processing
+            if attention_type == "prob":
+                attention = ProbSparseAttention(
+                    mask_flag=False, attention_dropout=dropout, output_attention=False
+                )
+            elif attention_type == "log":
+                attention = LogSparseAttention(
+                    mask_flag=False, attention_dropout=dropout, output_attention=False
+                )
+            elif attention_type == "full":
+                attention = FullAttention(
+                    mask_flag=False, attention_dropout=dropout, output_attention=False
+                )
+            elif attention_type == "memory":
+                attention = MemAttention(mask_flag=False)
+            else:
+                raise ValueError(f"Unknown attention type: {attention_type}")
+            self.multihead_attn = AttentionLayer(
+                attention, self.hidden_size, self.num_attention_heads
+            )
+
         self.post_attn_gan = _GateAddNorm(self.hidden_size, dropout=self.dropout)
 
         if self.feed_forward == "GatedResidualNetwork":
@@ -516,12 +561,19 @@ class _TFTModule(PLMixedCovariatesModule):
         )
 
         # multi-head attention
-        attn_out, attn_out_weights = self.multihead_attn(
-            q=attn_input if self.full_attention else attn_input[:, encoder_length:],
-            k=attn_input,
-            v=attn_input,
-            mask=self.attention_mask,
-        )
+        if self.attention_type == "axial":
+            attn_out = self.multihead_attn(
+                attn_input if self.full_attention else attn_input[:, encoder_length:]
+            )
+        else:
+            attn_out, attn_out_weights = self.multihead_attn(
+                queries=attn_input
+                if self.full_attention
+                else attn_input[:, encoder_length:],
+                keys=attn_input,
+                values=attn_input,
+                attention_mask=self.attention_mask,
+            )
 
         # skip connection over attention
         attn_out = self.post_attn_gan(
@@ -573,6 +625,7 @@ class TFTModel(MixedCovariatesTorchModel):
         add_relative_index: bool = False,
         loss_fn: Optional[nn.Module] = None,
         likelihood: Optional[Likelihood] = None,
+        attention_type: str = "interpretable",
         **kwargs,
     ):
         """Temporal Fusion Transformers (TFT) for Interpretable Time Series Forecasting.
@@ -783,6 +836,7 @@ class TFTModel(MixedCovariatesTorchModel):
         self.hidden_continuous_size = hidden_continuous_size
         self.add_relative_index = add_relative_index
         self.output_dim: Optional[Tuple[int, int]] = None
+        self.attention_type = attention_type
 
     def _create_model(self, train_sample: MixedCovariatesTrainTensorType) -> nn.Module:
         """
@@ -922,6 +976,7 @@ class TFTModel(MixedCovariatesTorchModel):
             feed_forward=self.feed_forward,
             hidden_continuous_size=self.hidden_continuous_size,
             add_relative_index=self.add_relative_index,
+            attention_type=self.attention_type,
             **self.pl_module_params,
         )
 
